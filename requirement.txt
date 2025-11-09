@@ -1,0 +1,41 @@
+# Core libraries for all 5 tasks (PNML Parser + Reachability + BDD + ILP)
+# -------------------------------------------------------------
+
+# XML parsing (built-in, nhưng thêm để rõ)
+lxml>=4.9.0
+
+# Data handling & timing utilities
+dataclasses-json>=0.6.6
+
+# -------------------------------
+# Task 1: PNML Parser
+# -------------------------------
+# (dùng xml.etree.ElementTree là built-in, không cần thêm gì đặc biệt)
+
+# -------------------------------
+# Task 2: Explicit Reachability
+# -------------------------------
+# (sử dụng collections, time, tracemalloc — built-in)
+
+# -------------------------------
+# Task 3: BDD-based Symbolic Reachability
+# -------------------------------
+# Binary Decision Diagram engine
+dd>=0.5.10
+
+# -------------------------------
+# Task 4: Deadlock Detection (ILP + BDD)
+# -------------------------------
+# Linear Programming Solver
+PuLP>=2.8.0
+
+# -------------------------------
+# Task 5: Optimization over Reachable Markings
+# -------------------------------
+# (sử dụng lại dd và PuLP)
+
+# -------------------------------
+# Optional (cho visualization & debug)
+# -------------------------------
+graphviz>=0.20.1
+matplotlib>=3.7.0
