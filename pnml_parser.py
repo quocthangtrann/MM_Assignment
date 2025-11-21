@@ -88,7 +88,7 @@ class PNMLParser:
             net_elem = nets[0]
         self.net_id = net_elem.get('id')
 
-        # Many PNMLs put places/transitions inside <page>
+        # Many PNMLs put places/transitions inside page
         page_tag = self._qn('page')
         pages = net_elem.findall(page_tag)
         if not pages:
@@ -132,7 +132,7 @@ class PNMLParser:
             pid = p.get('id')
             if pid is None:
                 raise PNMLParserError("Place without id encountered.")
-            # name (optional)
+            # name 
             name = None
             name_elem = p.find(name_tag)
             if name_elem is not None:
