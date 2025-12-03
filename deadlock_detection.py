@@ -1,216 +1,190 @@
 """
-deadlock_detection.py
+deadlock_detection_optimized.py
 
-Task 4: Deadlock detection combining ILP + BDD (exact when CandidateBDD enumerable)
-
+Task 4: Optimized Deadlock Detection using Hybrid CEGAR approach (ILP + BDD).
+Theory based on: Khomenko & Koutny, "Verification of Bounded Petri Nets Using Integer Programming".
 """
 
 from __future__ import annotations
 import argparse
 import time
-import xml.etree.ElementTree as ET
-from typing import Dict, Optional, List, Tuple
-import pulp
+import sys
+import xml.etree.ElementTree as ET  # <--- ĐÃ BỔ SUNG THƯ VIỆN NÀY
+from typing import Dict, Optional, List, Tuple, Any
 
-from pnml_parser import PNMLParser, parse_pnml_file, SAMPLE_PNML
-from bdd_reachability import BDDReachability
+# Check for pulp
+try:
+    import pulp
+except ImportError:
+    print("Error: 'pulp' library not found. Install via `pip install pulp`.")
+    sys.exit(1)
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def build_dead_bdd_from_petri(bdd_mgr, petri, place_list: List[str]):
-    """
-    Build BDD (over current vars named exactly as place_list)
-    representing dead markings: for every transition t, NOT(enabled_t).
-    enabled_t = ∧_{p in pre(t)} var(p)
-    """
-    mgr = bdd_mgr
-    # If any transition has empty pre-set then it's always enabled -> no dead markings at all
-    for tid in petri.transitions:
-        pre = [arc.source for arc in petri.arcs if arc.source in petri.places and arc.target == tid]
-        if len(pre) == 0:
-            # a transition with empty pre-set is always enabled => no dead markings
-            return mgr.false, False
+# Import PNML parser & BDD task
+try:
+    from pnml_parser import parse_pnml_file, SAMPLE_PNML, PNMLParser
+    from bdd_reachability import BDDReachability
+except ImportError:
+    print("Error: Required modules 'pnml_parser.py' or 'bdd_reachability.py' not found.")
+    sys.exit(1)
 
-    dead = mgr.true
-    for tid in petri.transitions:
-        pre = [arc.source for arc in petri.arcs if arc.source in petri.places and arc.target == tid]
-        enabled = mgr.true
-        for p in pre:
-            enabled &= mgr.var(p)
-        dead &= ~enabled
-    return dead, True
 
-def marking_from_assignment(assign: Dict[str,bool], place_list: List[str]) -> Dict[str,int]:
-    return {p: int(bool(assign.get(p, False))) for p in place_list}
+class ILPDeadlockSolver:
+    def __init__(self, petri):
+        self.petri = petri
+        self.places = sorted(list(petri.places.keys()))
+        self.transitions = sorted(list(petri.transitions))
+        self.p_idx = {p: i for i, p in enumerate(self.places)}
+        self.t_idx = {t: i for i, t in enumerate(self.transitions)}
+        
+        # Build Incidence Matrix (C)
+        # Rows = places, Cols = transitions
+        # C[p][t] = W(t, p) - W(p, t)
+        self.C = {} # Sparse dict: (place_idx, trans_idx) -> value
+        self._build_incidence_matrix()
+        
+        # Initialize ILP Problem
+        self.prob = pulp.LpProblem("Deadlock_Detection_StateEq", pulp.LpMinimize)
+        
+        # Variables
+        # Marking variables m_p (Binary for 1-safe nets)
+        self.m_vars = [pulp.LpVariable(f"m_{i}", cat="Binary") for i in range(len(self.places))]
+        
+        # Firing count variables sigma_t (Integer, non-negative)
+        self.sigma_vars = [pulp.LpVariable(f"sigma_{i}", lowBound=0, cat="Integer") for i in range(len(self.transitions))]
 
-# ILP builder for enumerated candidates:
-def solve_selection_ilp(markings: List[Dict[str,int]]) -> Tuple[Optional[Dict[str,int]], str]:
-    """
-    Given a list of concrete markings (each a dict place->0/1),
-    build ILP with binary selection variables y_i, constraint sum y_i == 1,
-    optionally link x_p variables to selected marking (x_p = sum_i y_i * m_i[p]).
-    Objective: arbitrary (maximize sum x_p) just to give solver an objective.
-    Return selected marking if solver finds feasible solution.
-    """
-    if not markings:
-        return None, "No markings provided"
+        # --- CONSTRAINTS ---
+        
+        # 1. State Equation: M = M0 + C * sigma
+        for i, p in enumerate(self.places):
+            m0_val = self.petri.initial_marking.get(p, 0)
+            # Gather terms for sum(C[p,t] * sigma[t])
+            dot_product_terms = []
+            for t_i in range(len(self.transitions)):
+                val = self.C.get((i, t_i), 0)
+                if val != 0:
+                    dot_product_terms.append(val * self.sigma_vars[t_i])
+            
+            self.prob += (self.m_vars[i] == m0_val + pulp.lpSum(dot_product_terms), f"StateEq_{p}")
 
-    places = sorted(markings[0].keys())
-    n = len(markings)
+        # 2. Deadlock Condition: All transitions must be disabled
+        for i, t in enumerate(self.transitions):
+            pre_places = self._get_pre_set(t)
+            if not pre_places:
+                # If a transition has no input places, it is ALWAYS enabled => No Deadlock possible
+                # Force infeasibility
+                self.prob += (pulp.lpSum([]) == 1, f"Always_Enabled_{t}")
+            else:
+                # Constraint: sum(m[p] for p in pre(t)) <= len(pre) - 1
+                pre_indices = [self.p_idx[p] for p in pre_places if p in self.p_idx]
+                self.prob += (pulp.lpSum(self.m_vars[idx] for idx in pre_indices) <= len(pre_indices) - 1, f"Disable_{t}")
 
-    prob = pulp.LpProblem("Select_marking_from_candidates", pulp.LpMaximize)
+    def _build_incidence_matrix(self):
+        def get_weight(arc):
+            # Handle different ways weight might be stored depending on parser
+            val = getattr(arc, 'inscription', 1)
+            try:
+                return int(val) if val is not None else 1
+            except:
+                return 1
 
-    # selection vars
-    y = [pulp.LpVariable(f"y_{i}", cat="Binary") for i in range(n)]
-    # optional x vars for places (binary)
-    x = {p: pulp.LpVariable(f"x_{p}", cat="Binary") for p in places}
+        # W(p, t): tokens consumed
+        for arc in self.petri.arcs:
+            if arc.source in self.p_idx and arc.target in self.t_idx:
+                p_i = self.p_idx[arc.source]
+                t_i = self.t_idx[arc.target]
+                w = get_weight(arc)
+                self.C[(p_i, t_i)] = self.C.get((p_i, t_i), 0) - w
 
-    # pick exactly one marking
-    prob += pulp.lpSum(y) == 1
+        # W(t, p): tokens produced
+        for arc in self.petri.arcs:
+            if arc.source in self.t_idx and arc.target in self.p_idx:
+                t_i = self.t_idx[arc.source]
+                p_i = self.p_idx[arc.target]
+                w = get_weight(arc)
+                self.C[(p_i, t_i)] = self.C.get((p_i, t_i), 0) + w
 
-    # link x_p = sum_i y_i * m_i[p]
-    for p in places:
-        prob += x[p] == pulp.lpSum(y[i] * markings[i][p] for i in range(n))
+    def _get_pre_set(self, tid):
+        return [arc.source for arc in self.petri.arcs 
+                if arc.source in self.petri.places and arc.target == tid]
 
-    # simple objective: maximize sum of x (arbitrary; solver needs objective)
-    prob += pulp.lpSum([x[p] for p in places])
+    def add_solution_cut(self, marking: Dict[str, int]):
+        """
+        Add a constraint to exclude the specific marking found.
+        Constraint: Sum(m_p for p where m=0) + Sum(1-m_p for p where m=1) >= 1
+        """
+        terms = []
+        for p, val in marking.items():
+            if p not in self.p_idx: continue
+            idx = self.p_idx[p]
+            if val == 1:
+                terms.append(1 - self.m_vars[idx])
+            else:
+                terms.append(self.m_vars[idx])
+        
+        self.prob += (pulp.lpSum(terms) >= 1, f"Cut_Solution_{len(self.prob.constraints)}")
 
-    # Solve
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=10))
-    status = pulp.LpStatus[prob.status] if isinstance(prob.status, int) else prob.status
-    if status not in ("Optimal", "Feasible"):
-        return None, f"Solver status {status}"
+    def solve(self) -> Optional[Dict[str, int]]:
+        # Use CBC solver, suppress output
+        solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=5)
+        self.prob.solve(solver)
+        
+        if self.prob.status == pulp.LpStatusOptimal:
+            result = {}
+            for i, p in enumerate(self.places):
+                val = pulp.value(self.m_vars[i])
+                result[p] = int(round(val)) if val is not None else 0
+            return result
+        return None
 
-    # find selected index
-    sel_idx = None
-    for i in range(n):
-        val = pulp.value(y[i])
-        if val is not None and round(val) == 1:
-            sel_idx = i
-            break
-    if sel_idx is None:
-        # fallback: choose first marking
-        sel_idx = 0
-    return markings[sel_idx], f"OK (status {status})"
-
-# ILP verifier (redundant but uses ILP): enforces marking == sample and checks dead constraints
-def verify_dead_with_ilp(petri, marking: Dict[str,int], time_limit: int = 2) -> Tuple[bool, Optional[Dict[str,int]]]:
-    places = sorted(petri.places.keys())
-    prob = pulp.LpProblem("Verify_dead_marking", pulp.LpStatusOptimal)
-    mvars = {p: pulp.LpVariable(f"m_{p}", cat="Binary") for p in places}
-    # enforce equality to sampled marking
-    for p in places:
-        prob += mvars[p] == marking[p]
-    # dead constraints: for each transition, sum pre <= |pre|-1
-    for tid in petri.transitions:
-        pre = [arc.source for arc in petri.arcs if arc.source in petri.places and arc.target == tid]
-        if pre:
-            prob += pulp.lpSum(mvars[p] for p in pre) <= len(pre) - 1
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit))
-    status = pulp.LpStatus[prob.status] if isinstance(prob.status, int) else prob.status
-    if status in ("Optimal", "Feasible"):
-        # return the marking (should equal input)
-        out = {p: int(round(pulp.value(mvars[p]))) for p in places}
-        return True, out
-    return False, None
-
-# ------------------------------------------------------------
-# Main detection function
-# ------------------------------------------------------------
-def detect_deadlock_ilp_bdd(petri, enum_limit: int = 1000, sample_limit: int = 1000, use_exact_if_small: bool = True):
-    """
-    Returns one dead marking (dict place->0/1) if found, else None.
-    enum_limit: if number of candidates <= enum_limit, enumerate all and run selection ILP.
-    sample_limit: if candidate large, sample up to sample_limit candidates and verify by ILP.
-    """
-    t0_all = time.perf_counter()
-
-    # Build R via BDDReachability
-    t0 = time.perf_counter()
+def detect_deadlock_optimized(petri):
+    print("--- Phase 1: Building Reachability BDD (Oracle) ---")
     bdd_model = BDDReachability(petri)
     R_bdd, stats = bdd_model.compute_reachability(verbose=False)
-    t1 = time.perf_counter()
-    time_bdd = t1 - t0
+    print(f"  BDD built in {stats['time_sec']}s. Reachable states: {stats['reachable_count']}")
+    
+    print("--- Phase 2: Initializing ILP Solver (State Eq + Deadlock) ---")
+    ilp_solver = ILPDeadlockSolver(petri)
+    
+    print("--- Phase 3: CEGAR Loop (ILP Generate -> BDD Verify) ---")
+    iteration = 0
+    
+    while True:
+        iteration += 1
+        # 1. Solve ILP for a candidate
+        candidate = ilp_solver.solve()
+        
+        if candidate is None:
+            print(f"  [Iter {iteration}] ILP Infeasible. No (more) structural deadlocks potential.")
+            return None, iteration
+            
+        # 2. Check with BDD Oracle
+        # Check if candidate matches valid place names in BDD
+        assignment = {p: bool(v) for p, v in candidate.items() if p in bdd_model.place_set}
+        
+        # Efficient BDD check: restrict R with assignment. If result is True (1), it's reachable.
+        # Note: bdd.let returns a new BDD. If it is not 'false', the assignment is valid.
+        # Since we provide full assignment, result should be TRUE or FALSE node.
+        check_bdd = bdd_model.bdd.let(assignment, R_bdd)
+        is_reachable = (check_bdd == bdd_model.bdd.true)
+        
+        if is_reachable:
+            print(f"  [Iter {iteration}] Candidate Verified! Found Reachable Deadlock.")
+            return candidate, iteration
+        else:
+            # 3. Spurious: Add Cut and Continue
+            # print(f"  [Iter {iteration}] Candidate Unreachable (Spurious). Adding cut...")
+            ilp_solver.add_solution_cut(candidate)
 
-    mgr = bdd_model.bdd
-    place_list = bdd_model.place_list
-
-    # Build DeadBDD
-    dead_bdd, possible = build_dead_bdd_from_petri(mgr, petri, place_list)
-    if not possible:
-        print("There exists a transition with empty pre-set (always enabled). No dead markings possible.")
-        return None, {"time_bdd": time_bdd, "time_ilp": 0.0, "method": "none (always enabled)"}
-
-    # Candidate = reachable ∧ dead
-    candidate = R_bdd & dead_bdd
-    if candidate == mgr.false:
-        print("No reachable dead markings found (BDD intersection empty).")
-        return None, {"time_bdd": time_bdd, "time_ilp": 0.0, "method": "bdd-intersection"}
-
-    # Try to estimate size: attempt to enumerate up to enum_limit+1
-    markings = []
-    t_enum_start = time.perf_counter()
-    count = 0
-    try:
-        for assign in mgr.sat_iter(candidate):
-            markings.append(marking_from_assignment(assign, place_list))
-            count += 1
-            if count > enum_limit:
-                break
-    except Exception:
-        # If sat_iter fails (unlikely), fallback to sampling
-        pass
-    t_enum_end = time.perf_counter()
-    enum_time = t_enum_end - t_enum_start
-
-    # If enumerated small enough and use_exact_if_small, use ILP selection over enumerated markings
-    t_ilp_start = time.perf_counter()
-    if use_exact_if_small and 0 < len(markings) <= enum_limit:
-        print(f"Candidate dead markings enumerated: {len(markings)} (using ILP selection among them)")
-        selected, info = solve_selection_ilp(markings)
-        t_ilp_end = time.perf_counter()
-        return selected, {"time_bdd": time_bdd, "time_enum": enum_time, "time_ilp": t_ilp_end - t_ilp_start, "method": "enumeration+ilp", "info": info}
-    else:
-        # Candidate large, fallback to sampling + verify via ILP
-        print(f"CandidateBDD large or not fully enumerated; sampled {sample_limit} assignments for ILP verification.")
-        sampled = 0
-        t_sample_start = time.perf_counter()
-        for assign in mgr.pick_iter(candidate):
-            if sampled >= sample_limit:
-                break
-            sampled += 1
-            marking = marking_from_assignment(assign, place_list)
-            # quick direct check (no ILP) - this is sufficient
-            is_dead = True
-            for tid in petri.transitions:
-                pre = [arc.source for arc in petri.arcs if arc.source in petri.places and arc.target == tid]
-                if pre and all(marking.get(p,0) == 1 for p in pre):
-                    is_dead = False
-                    break
-            if is_dead:
-                # verify with ILP (time-limited) to conform to assignment
-                ok, out = verify_dead_with_ilp(petri, marking, time_limit=2)
-                if ok:
-                    t_ilp_end = time.perf_counter()
-                    return out, {"time_bdd": time_bdd, "time_sample": time.perf_counter()-t_sample_start, "time_ilp": t_ilp_end - t_ilp_start, "method": "sampling+ilp", "sampled": sampled}
-        t_sample_end = time.perf_counter()
-        t_ilp_end = time.perf_counter()
-        return None, {"time_bdd": time_bdd, "time_sample": t_sample_end - t_sample_start, "time_ilp": 0.0, "method": "sampling+ilp", "sampled": sampled}
-
-# ------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------
 def run_cli():
-    parser = argparse.ArgumentParser(description="Task 4: Deadlock detection combining ILP + BDD")
+    parser = argparse.ArgumentParser(description="Task 4: Optimized Deadlock Detection (CEGAR)")
     parser.add_argument("file", nargs="?", help="PNML file")
     parser.add_argument("--test", action="store_true", help="Use built-in SAMPLE_PNML")
-    parser.add_argument("--enum-limit", type=int, default=1000, help="Max candidates to enumerate for exact ILP")
-    parser.add_argument("--sample-limit", type=int, default=1000, help="Max samples to pick when candidate large")
-    parser.add_argument("--no-exact", dest="use_exact", action="store_false", help="Don't try exact enumerate+ILP even if small")
     args = parser.parse_args()
 
     if args.test:
+        if SAMPLE_PNML is None:
+            print("Error: SAMPLE_PNML not found in pnml_parser.")
+            return
         root = ET.fromstring(SAMPLE_PNML)
         petri = PNMLParser(root).parse()
         print("Using SAMPLE_PNML")
@@ -221,19 +195,19 @@ def run_cli():
         return
 
     print(f"Net: {getattr(petri,'id','?')} | Places: {len(petri.places)} | Transitions: {len(petri.transitions)}")
-    t0 = time.perf_counter()
-    deadmark, stats = detect_deadlock_ilp_bdd(petri, enum_limit=args.enum_limit, sample_limit=args.sample_limit, use_exact_if_small=args.use_exact)
-    t1 = time.perf_counter()
-    if deadmark:
-        print("\nDeadlock (reachable) found:")
-        for p, v in deadmark.items():
-            print(f"  {p}: {v}")
+    
+    t_start = time.perf_counter()
+    deadlock, iters = detect_deadlock_optimized(petri)
+    t_end = time.perf_counter()
+    
+    print("\n" + "="*60)
+    if deadlock:
+        print(f"RESULT: DEADLOCK FOUND in {t_end - t_start:.4f}s (after {iters} ILP iterations)")
+        active_places = [p for p, v in deadlock.items() if v == 1]
+        print(f"Deadlock Marking: {active_places}")
     else:
-        print("\nNo reachable deadlock found (within procedure).")
-    print("\nStats:")
-    for k, v in stats.items():
-        print(f"  {k}: {v}")
-    print(f"Total time: {t1 - t0:.4f} s")
+        print(f"RESULT: NO DEADLOCK REACHABLE (Time: {t_end - t_start:.4f}s)")
+    print("="*60)
 
 if __name__ == "__main__":
     run_cli()
