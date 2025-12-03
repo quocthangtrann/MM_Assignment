@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import time
 import sys
-import xml.etree.ElementTree as ET  # <--- ĐÃ BỔ SUNG THƯ VIỆN NÀY
+import xml.etree.ElementTree as ET  
 from typing import Dict, Optional, List, Tuple, Any
 
 # Check for pulp

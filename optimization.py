@@ -26,7 +26,6 @@ except ImportError:
 try:
     from pnml_parser import parse_pnml_file, SAMPLE_PNML, PNMLParser
     from bdd_reachability import BDDReachability
-    # Re-use solver class from Task 4 if available, or redefine simplified version here
 except ImportError:
     print("Error: Required modules not found.")
     sys.exit(1)
@@ -150,7 +149,6 @@ def run_cli():
     parser.add_argument("--c", type=str, default="all", help="Objective weights JSON")
     args = parser.parse_args()
 
-    # ... (Parsing logic same as Code 1) ...
     import xml.etree.ElementTree as ET
     if args.test:
         petri = PNMLParser(ET.fromstring(SAMPLE_PNML)).parse()
