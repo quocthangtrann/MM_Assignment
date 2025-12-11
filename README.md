@@ -1,40 +1,61 @@
-MM_Assignment — Petri Net Reachability, BDD, ILP Optimization
+# MM_Assignment — Petri Net Reachability, BDD, ILP Optimization
 
-This project implements all five tasks of the CO2011 / MM-251 Mathematical Modeling assignment at HCMUT:
+## Project Overview
+This project implements all five tasks of the **CO2011 / MM-251 Mathematical Modeling** assignment at HCMUT.  
+It provides a complete analysis pipeline for **1-safe Petri Nets**, combining both explicit and symbolic methods to compute reachability, detect deadlocks, and solve optimization problems.
 
-PNML parsing
+The system supports:
+- **PNML Parsing**  
+- **Explicit Reachability (BFS)**  
+- **Symbolic Reachability using BDD**  
+- **Deadlock Detection (BDD + ILP)**  
+- **Optimization over reachable markings**  
 
-Explicit reachability (BFS)
+This framework demonstrates how modern symbolic techniques (Binary Decision Diagrams and Integer Linear Programming) significantly improve scalability over classical explicit-state search.
 
-Symbolic reachability using BDD
+---
 
-Deadlock detection (BDD + ILP)
+## System Architecture
+The system is modularized into four main components:
 
-Optimization over reachable markings
+- **PNML Processor**  
+  Parses a PNML Petri Net file and constructs internal graph structures (places, transitions, incidence matrix).
 
-The system provides a complete analysis pipeline for 1-safe Petri nets, integrating classical explicit search and symbolic techniques (BDD + ILP).
+- **Explicit Reachability Engine**  
+  Implements state-space exploration using classical BFS, enumerating all reachable markings.
 
-📦 Installation
+- **Symbolic BDD Reachability**  
+  Represents transition relations and reachable markings as Boolean functions, enabling compact symbolic traversal.
 
-1️⃣ Install dependencies
+- **ILP-based Deadlock & Optimization Engine**  
+  Formulates deadlock constraints and optimization objectives as ILP problems using the reachable markings.
 
-The project uses Python 3.9+.
+---
 
+## Installation
+
+### 1️⃣ Install Dependencies  
+The project requires **Python 3.9+**.
+
+```bash
 pip3 install -r requirements.txt
+```
 
-Replace philo.pnml with any Petri net in PNML format.
+2️⃣ Input Petri Net
 
-▶️ How to run?
+Replace philo.pnml with any Petri Net in standard PNML format.
 
-✔ Run all 5 tasks at once:
-
+---
+## Build and Execution
+✔ Run all 5 tasks sequentially:
+```bash
 python3 main.py philo.pnml
-
-✔ Compare Explicit BFS vs BDD Symbolic Reachability:
-
+```
+✔ Compare Explicit BFS vs Symbolic BDD Reachability:
+```bash
 python3 bdd_reachability.py philo.pnml --compare
-
-✔ Dump all reachable markings (729 in philo example):
-
+```
+✔ Dump all reachable markings (e.g., 729 for the philosopher model):
+```bash
 python3 bdd_reachability.py philo.pnml --dump
-
+```
